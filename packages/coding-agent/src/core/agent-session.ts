@@ -67,6 +67,7 @@ import { type BashResult, executeBashWithOperations } from "./bash-executor.ts";
 import { generateBugReportSummary } from "./bug-report.ts";
 import type { CacheWarmer, CacheWarmingStatus } from "./cache-warmer.ts";
 import {
+	appendArchivedSessionPointer,
 	type CompactionPreparation,
 	type CompactionResult,
 	calculateContextTokens,
@@ -76,6 +77,8 @@ import {
 	estimateProjectedContextTokens,
 	estimateTokens,
 	generateBranchSummary,
+	generateRetrievalCues,
+	getMessagesToArchive,
 	prepareCompaction,
 	shouldCompact,
 } from "./compaction/index.ts";
@@ -116,6 +119,7 @@ import {
 } from "./extensions/index.ts";
 import { type BeforeAgentStartTrigger, emitSessionShutdownEvent } from "./extensions/runner.ts";
 import { createToolNameMatcher, isMcpToolName } from "./mcp-servers.ts";
+import { MemoryStore, parseRetrievalCuesFromSummary } from "./memory/index.ts";
 import { type BashExecutionMessage, type CustomMessage, convertToLlm } from "./messages.ts";
 import { ModelRegistry } from "./model-registry.ts";
 import type { ModelRuntime } from "./model-runtime.ts";
@@ -148,7 +152,7 @@ import {
 	normalizeBuildSystemPromptOptions,
 } from "./system-prompt.ts";
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.ts";
-import { createAllToolDefinitions } from "./tools/index.ts";
+import { createAllToolDefinitions, createMemorySearchToolDefinition } from "./tools/index.ts";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
 import { addUsageToTotals, combineUsage, createUsageTotals } from "./usage-totals.ts";
 import {
@@ -311,7 +315,11 @@ export interface AgentSessionConfig {
 	extensionRunnerRef?: { current?: ExtensionRunner };
 	/** Session start event metadata emitted when extensions bind to this runtime. */
 	sessionStartEvent?: SessionStartEvent;
+	/** Dark-layer memory store for conversation archival and sparse retrieval. */
+	memoryStore?: MemoryStore;
 }
+
+export type AgentSessionOptions = AgentSessionConfig;
 
 export interface ExtensionBindings {
 	uiContext?: ExtensionUIContext;
@@ -410,6 +418,7 @@ export class AgentSession {
 	readonly agent: Agent;
 	readonly sessionManager: SessionManager;
 	readonly settingsManager: SettingsManager;
+	private _memoryStore: MemoryStore;
 
 	private _scopedModels: Array<{ model: Model<any>; thinkingLevel?: ThinkingLevel }>;
 
@@ -519,6 +528,7 @@ export class AgentSession {
 		this.agent = config.agent;
 		this.sessionManager = config.sessionManager;
 		this.settingsManager = config.settingsManager;
+		this._memoryStore = config.memoryStore ?? new MemoryStore();
 		this._scopedModels = config.scopedModels ?? [];
 		this._resourceLoader = config.resourceLoader;
 		this._customTools = config.customTools ?? [];
@@ -560,6 +570,10 @@ export class AgentSession {
 
 	get modelRuntime(): ModelRuntime {
 		return this._modelRuntime;
+	}
+
+	get memoryStore(): MemoryStore {
+		return this._memoryStore;
 	}
 
 	private async _getRequiredRequestAuth(
@@ -1802,6 +1816,13 @@ export class AgentSession {
 		const loadedSkills = this._resourceLoader.getSkills().skills;
 		const loadedContextFiles = this._resourceLoader.getAgentsFiles().agentsFiles;
 
+		const promptGuidelines: string[] = [];
+		// Gate on the active set, not the registry: the guideline must not tell the model to use a
+		// tool it cannot see, which happens when `--tools`/`defaultTools` excludes memory_search.
+		if (this._isAllowedTool("memory_search") && validToolNames.includes("memory_search")) {
+			promptGuidelines.push(...(this._toolPromptGuidelines.get("memory_search") ?? []));
+		}
+
 		this._baseSystemPromptOptions = normalizeBuildSystemPromptOptions({
 			cwd: this._cwd,
 			skills: loadedSkills,
@@ -1812,6 +1833,7 @@ export class AgentSession {
 			hiddenTools: [...this._hiddenDeclarations],
 			toolSnippets,
 			toolGuidelines: Object.fromEntries(this._toolPromptGuidelines),
+			promptGuidelines,
 		});
 	}
 
@@ -1938,6 +1960,7 @@ export class AgentSession {
 	 * Start a run from a user or custom message. The session counts as busy from here on, so
 	 * messages sent while before_agent_start handlers run are queued into this run instead of
 	 * starting another, and an abort requested meanwhile aborts the run as soon as it exists.
+	 * @param trigger - The message that starts the run
 	 * @param onStarted Called once the run's messages are prepared, before the first request.
 	 */
 	private async _startRun(trigger: BeforeAgentStartTrigger, onStarted?: () => void): Promise<void> {
@@ -2356,6 +2379,7 @@ export class AgentSession {
 	 * Delivered after the current assistant turn finishes executing its tool calls,
 	 * before the next LLM call.
 	 * Expands skill commands and prompt templates. Errors on extension commands.
+	 * @param text - The message text to send
 	 * @param images Optional image attachments to include with the message
 	 * @param options Input source; defaults to interactive
 	 * @throws Error if text is an extension command
@@ -2372,6 +2396,7 @@ export class AgentSession {
 	 * Queue a follow-up message to be processed after the agent finishes.
 	 * Delivered only when agent has no more tool calls or steering messages.
 	 * Expands skill commands and prompt templates. Errors on extension commands.
+	 * @param text - The message text to send
 	 * @param images Optional image attachments to include with the message
 	 * @param options Input source; defaults to interactive
 	 * @throws Error if text is an extension command
@@ -2454,6 +2479,7 @@ export class AgentSession {
 	 * - Not streaming + no trigger: appends to state/session, no turn
 	 *
 	 * @param message Custom message with customType, content, display, details
+	 * @param options - Delivery options
 	 * @param options.triggerTurn If true and not streaming, triggers a new LLM turn
 	 * @param options.deliverAs Delivery mode: "steer", "followUp", or "nextTurn"
 	 */
@@ -2526,6 +2552,7 @@ export class AgentSession {
 	 * When the agent is streaming, use deliverAs to specify how to queue the message.
 	 *
 	 * @param content User message content (string or content array)
+	 * @param options - Delivery options
 	 * @param options.deliverAs Delivery mode when streaming: "steer" or "followUp"
 	 * @param options.expandPromptTemplates Whether to dispatch extension commands and expand skill commands and prompt templates. Default: false.
 	 */
@@ -2681,6 +2708,7 @@ export class AgentSession {
 	 * Cycle to next/previous model.
 	 * Uses scoped models (from --models flag) if available, otherwise all available models.
 	 * @param direction - "forward" (default) or "backward"
+	 * @param options - Model mutation options
 	 * @returns The new model info, or undefined if only one model available
 	 */
 	async cycleModel(
@@ -2884,6 +2912,7 @@ export class AgentSession {
 	): Promise<CompactionResult> {
 		// Resolve the request only when Pi summarizes itself: routing may call models or fail.
 		const request = await this._getSummarizationRequestAuth(model, signal);
+		const settings = this.settingsManager.getCompactionSettings(model);
 		return compact(
 			preparation,
 			request.model,
@@ -2896,7 +2925,9 @@ export class AgentSession {
 			request.env,
 			this.settingsManager.getRetrySettings(),
 			this._summarizationRetryCallbacks({ source: "compaction", reason }),
-			undefined, // sessionId
+			this.sessionManager.getSessionId(),
+			(settings.strategy ?? "native") === "sliding-memory" ? this._memoryStore : undefined,
+			this.sessionManager.getParentSessionId(),
 		);
 	}
 
@@ -2983,6 +3014,35 @@ export class AgentSession {
 				tokensBefore = extensionCompaction.tokensBefore;
 				usage = extensionCompaction.usage;
 				details = extensionCompaction.details;
+
+				const messagesToArchive = getMessagesToArchive(preparation);
+				const existingDetails = (details && typeof details === "object" ? details : {}) as Record<string, unknown>;
+				const isSlidingMemory = (settings.strategy ?? "native") === "sliding-memory";
+				if (isSlidingMemory && this._memoryStore && messagesToArchive.length > 0 && !existingDetails.memoryNodeId) {
+					let cues = parseRetrievalCuesFromSummary(summary);
+					if (cues.length === 0 && model) {
+						const auth = await this._getSummarizationRequestAuth(model, this._compactionAbortController.signal);
+						cues = await generateRetrievalCues(summary, {
+							model: auth.model,
+							apiKey: auth.apiKey,
+							headers: auth.headers,
+							env: auth.env,
+							signal: this._compactionAbortController.signal,
+							streamFn: this.agent.streamFunction,
+							sessionId: this.sessionManager.getSessionId(),
+						});
+					}
+					const node = this._memoryStore.archiveSessionSegment({
+						sessionId: this.sessionManager.getSessionId() || "session",
+						parentSessionId: this.sessionManager.getParentSessionId(),
+						firstKeptEntryId,
+						messages: messagesToArchive,
+						summary,
+						cues,
+					});
+					details = { ...existingDetails, memoryNodeId: node.id };
+					summary = appendArchivedSessionPointer(summary, node);
+				}
 			} else {
 				// Shared default summary generator, also used by automatic compaction.
 				const result = await this._runDefaultCompaction(
@@ -3156,10 +3216,22 @@ export class AgentSession {
 				latestAssistantEdit?.replacement !== null);
 		const assistantUsageMatchesProjection = assistantIsProjected && !hasPostAssistantContextEdit;
 		const explicitOverflow = assistantMessage.stopReason === "error" && isContextOverflow(assistantMessage);
+		const projectedTokens = estimateProjectedContextTokens(currentProjection, branch).tokens;
+		const isSlidingMemory = (settings.strategy ?? "native") === "sliding-memory";
+		// In sliding-memory mode, if the response completed cleanly and the actual conversation
+		// projection is within the context window, do not let cumulative cacheRead trigger silent
+		// overflow. A truncated ("length") response is not a completed one: its usage still
+		// reflects the real window pressure.
+		const shouldIgnoreSilentOverflow =
+			isSlidingMemory &&
+			assistantMessage.stopReason === "stop" &&
+			projectedTokens < contextWindow - settings.reserveTokens;
 		const contextOverflow =
 			sameModel &&
 			((explicitOverflow && assistantRetainedForExplicitRecovery) ||
-				(assistantUsageMatchesProjection && isContextOverflow(assistantMessage, contextWindow)));
+				(!shouldIgnoreSilentOverflow &&
+					assistantUsageMatchesProjection &&
+					isContextOverflow(assistantMessage, contextWindow)));
 		const recoverableLength =
 			sameModel && assistantIsProjected && isRecoverableLength(assistantMessage, messageModel.maxTokens);
 		if (contextOverflow || recoverableLength) {
@@ -3206,11 +3278,12 @@ export class AgentSession {
 		// This ensures sessions that hit persistent API errors (e.g. 529) or malformed zero-usage
 		// responses can still compact and do not reset context accounting.
 		let contextTokens: number;
-		const projection = currentProjection;
-		const hasContextEdits = projection.entries.some((entry) => entry.sourceEntry.type === "context_edit");
+		const hasContextEdits = currentProjection.entries.some((entry) => entry.sourceEntry.type === "context_edit");
 		const directContextTokens = assistantMessage.usage ? calculateContextTokens(assistantMessage.usage) : 0;
 		if (hasContextEdits) {
-			contextTokens = estimateProjectedContextTokens(projection, branch).tokens;
+			contextTokens = projectedTokens;
+		} else if (isSlidingMemory && directContextTokens > contextWindow && projectedTokens < contextWindow) {
+			contextTokens = projectedTokens;
 		} else if (assistantMessage.stopReason === "error" || directContextTokens === 0) {
 			const messages = this.agent.state.messages;
 			const estimate = estimateContextTokens(messages);
@@ -3312,6 +3385,35 @@ export class AgentSession {
 				tokensBefore = extensionCompaction.tokensBefore;
 				usage = extensionCompaction.usage;
 				details = extensionCompaction.details;
+
+				const messagesToArchive = getMessagesToArchive(preparation);
+				const existingDetails = (details && typeof details === "object" ? details : {}) as Record<string, unknown>;
+				const isSlidingMemory = (settings.strategy ?? "native") === "sliding-memory";
+				if (isSlidingMemory && this._memoryStore && messagesToArchive.length > 0 && !existingDetails.memoryNodeId) {
+					let cues = parseRetrievalCuesFromSummary(summary);
+					if (cues.length === 0 && model) {
+						const auth = await this._getSummarizationRequestAuth(model, abortController.signal);
+						cues = await generateRetrievalCues(summary, {
+							model: auth.model,
+							apiKey: auth.apiKey,
+							headers: auth.headers,
+							env: auth.env,
+							signal: abortController.signal,
+							streamFn: this.agent.streamFunction,
+							sessionId: this.sessionManager.getSessionId(),
+						});
+					}
+					const node = this._memoryStore.archiveSessionSegment({
+						sessionId: this.sessionManager.getSessionId() || "session",
+						parentSessionId: this.sessionManager.getParentSessionId(),
+						firstKeptEntryId,
+						messages: messagesToArchive,
+						summary,
+						cues,
+					});
+					details = { ...existingDetails, memoryNodeId: node.id };
+					summary = appendArchivedSessionPointer(summary, node);
+				}
 			} else {
 				// Shared default summary generator, also used by manual compaction.
 				const compactResult = await this._runDefaultCompaction(
@@ -3781,6 +3883,24 @@ export class AgentSession {
 		this._baseToolDefinitions = new Map(
 			Object.entries(baseToolDefinitions).map(([name, tool]) => [name, tool as ToolDefinition]),
 		);
+		const hasMemorySearchOverride = Boolean(this._baseToolsOverride?.memory_search);
+		const compactionStrategy = this.settingsManager.getCompactionStrategy(this.model);
+		const memorySearchRequested =
+			options.activeToolNames?.includes("memory_search") ||
+			this._initialActiveToolNames?.includes("memory_search") ||
+			this.settingsManager.getDefaultTools()?.includes("memory_search");
+		if (
+			(compactionStrategy === "sliding-memory" || hasMemorySearchOverride || memorySearchRequested) &&
+			!this._baseToolDefinitions.has("memory_search") &&
+			(!this._baseToolsOverride || this._baseToolsOverride.memory_search)
+		) {
+			this._baseToolDefinitions.set(
+				"memory_search",
+				(this._baseToolsOverride?.memory_search
+					? createToolDefinitionFromAgentTool(this._baseToolsOverride.memory_search)
+					: createMemorySearchToolDefinition(this._memoryStore)) as ToolDefinition,
+			);
+		}
 
 		const extensionsResult = this._resourceLoader.getExtensions();
 		if (options.flagValues) {
@@ -3804,7 +3924,9 @@ export class AgentSession {
 
 		const defaultActiveToolNames = this._baseToolsOverride
 			? Object.keys(this._baseToolsOverride)
-			: ["read", "bash", "edit", "write"];
+			: compactionStrategy === "sliding-memory"
+				? [...DEFAULT_TOOL_NAMES, "memory_search"]
+				: [...DEFAULT_TOOL_NAMES];
 		const baseActiveToolNames = options.activeToolNames ?? defaultActiveToolNames;
 		this._refreshToolRegistry({
 			activeToolNames: baseActiveToolNames,
@@ -3824,13 +3946,16 @@ export class AgentSession {
 		const previousFlagValues = oldRunner.getFlagValues();
 		await emitSessionShutdownEvent(oldRunner, { type: "session_shutdown", reason: "reload" });
 		oldRunner.invalidate();
-		const getDefaultTools = () =>
-			this._usesDefaultTools
-				? applyToolModifiers(
-						this.settingsManager.getDefaultTools() ?? DEFAULT_TOOL_NAMES,
-						this._defaultToolModifiers,
-					)
-				: [];
+		const getDefaultTools = () => {
+			if (!this._usesDefaultTools) return [];
+			const base = this.settingsManager.getDefaultTools() ?? DEFAULT_TOOL_NAMES;
+			const withMemory =
+				this.settingsManager.getCompactionStrategy(this.model) === "sliding-memory" &&
+				!base.includes("memory_search")
+					? [...base, "memory_search"]
+					: base;
+			return applyToolModifiers(withMemory, this._defaultToolModifiers);
+		};
 		const previousDefaultTools = new Set(getDefaultTools());
 		await this.settingsManager.reload();
 		this.syncQueueModesFromSettings();
@@ -3996,6 +4121,7 @@ export class AgentSession {
 	 * Adds result to agent context and session.
 	 * @param command The bash command to execute
 	 * @param onChunk Optional streaming callback for output
+	 * @param options - Execution options
 	 * @param options.excludeFromContext If true, command output won't be sent to LLM (!! prefix)
 	 * @param options.id Optional identifier included in bash execution update events
 	 * @param options.operations Custom BashOperations for remote execution
@@ -4117,6 +4243,7 @@ export class AgentSession {
 	 * Unlike fork() which creates a new session file, this stays in the same file.
 	 *
 	 * @param targetId The entry ID to navigate to
+	 * @param options - Navigation options
 	 * @param options.summarize Whether user wants to summarize abandoned branch
 	 * @param options.customInstructions Custom instructions for summarizer
 	 * @param options.replaceInstructions If true, customInstructions replaces the default prompt
@@ -4517,10 +4644,8 @@ export class AgentSession {
 			.reverse()
 			.find((m) => {
 				if (m.role !== "assistant") return false;
-				const msg = m as AssistantMessage;
 				// Skip aborted messages with no content
-				if (msg.stopReason === "aborted" && msg.content.length === 0) return false;
-				return true;
+				return !((m as AssistantMessage).stopReason === "aborted" && (m as AssistantMessage).content.length === 0);
 			});
 
 		if (!lastAssistant) return undefined;

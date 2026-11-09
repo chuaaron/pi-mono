@@ -273,6 +273,39 @@ export function assertValidSessionId(id: string): void {
 	}
 }
 
+export function extractSessionIdFromPath(filePathOrId: string): string {
+	if (!filePathOrId.includes("/") && !filePathOrId.includes("\\") && !filePathOrId.endsWith(".jsonl")) {
+		return filePathOrId;
+	}
+	try {
+		if (existsSync(filePathOrId)) {
+			const fd = openSync(filePathOrId, "r");
+			try {
+				const buffer = Buffer.alloc(1024);
+				const bytesRead = readSync(fd, buffer, 0, 1024, 0);
+				const text = buffer.toString("utf8", 0, bytesRead);
+				const firstLine = text.split("\n")[0];
+				if (firstLine) {
+					const parsed = JSON.parse(firstLine);
+					if (parsed.type === "session" && typeof parsed.id === "string") {
+						return parsed.id;
+					}
+				}
+			} finally {
+				closeSync(fd);
+			}
+		}
+	} catch {
+		// fall through to filename heuristic
+	}
+	const base = basename(filePathOrId).replace(/\.jsonl$/, "");
+	const underscoreIndex = base.indexOf("_");
+	if (underscoreIndex !== -1 && underscoreIndex < base.length - 1) {
+		return base.slice(underscoreIndex + 1);
+	}
+	return base;
+}
+
 /** Generate a unique short ID (8 hex chars, collision-checked) */
 function generateId(byId: { has(id: string): boolean }): string {
 	for (let i = 0; i < 100; i++) {
@@ -1516,6 +1549,13 @@ export class SessionManager {
 	getHeader(): SessionHeader | null {
 		const h = this.fileEntries.find((e) => e.type === "session");
 		return h ? (h as SessionHeader) : null;
+	}
+
+	/** Resolved parent session ID, extracting the session ID if parentSession is a file path. */
+	getParentSessionId(): string | undefined {
+		const parent = this.getHeader()?.parentSession;
+		if (!parent) return undefined;
+		return extractSessionIdFromPath(parent);
 	}
 
 	/** Number of session entries (excludes header), without copying them like `getEntries()`. */

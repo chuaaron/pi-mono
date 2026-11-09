@@ -70,6 +70,30 @@ describe("defaultTools setting", () => {
 		session.dispose();
 	});
 
+	it("activates memory_search and contributes its guideline when sliding-memory strategy is enabled", async () => {
+		const settingsManager = SettingsManager.inMemory({
+			compaction: { strategy: "sliding-memory" },
+		});
+		const resourceLoader = new DefaultResourceLoader({
+			cwd: tempDir,
+			agentDir,
+			settingsManager,
+		});
+		await resourceLoader.reload();
+		const { session } = await createAgentSession({
+			cwd: tempDir,
+			agentDir,
+			model: getModel("anthropic", "claude-sonnet-4-5")!,
+			settingsManager,
+			sessionManager: SessionManager.inMemory(tempDir),
+			resourceLoader,
+		});
+
+		expect(session.getActiveToolNames()).toContain("memory_search");
+		expect(session.systemPrompt).toContain("use the `memory_search` tool");
+		session.dispose();
+	});
+
 	it("can select powershell instead of bash", async () => {
 		const session = await createSession(["read", "powershell", "edit", "write"]);
 

@@ -10,15 +10,41 @@ function timeoutSetting(options?: TSchemaOptions) {
 	return Type.Union([Type.Number({ minimum: 0 }), Type.Literal("disabled")], options);
 }
 
+const CompactionStrategySchema = Type.Union([Type.Literal("sliding-memory"), Type.Literal("native")], {
+	description: 'Compaction strategy: "sliding-memory" (lossless archival + sliding window) or "native" (Pi default).',
+	default: SETTINGS_DEFAULTS.compaction.strategy,
+});
+
 const CompactionModelOverrideSchema = Type.Object({
+	strategy: Type.Optional(CompactionStrategySchema),
 	reserveTokens: Type.Optional(nonNegativeSafeInteger()),
 	keepRecentTokens: Type.Optional(nonNegativeSafeInteger()),
+	capacityRatioThreshold: Type.Optional(
+		Type.Number({
+			minimum: 0,
+			maximum: 1,
+			description: "Fraction of context window capacity (e.g. 0.5) that triggers compaction.",
+		}),
+	),
 });
 
 const CompactionSettingsSchema = Type.Object({
 	enabled: Type.Optional(Type.Boolean({ default: SETTINGS_DEFAULTS.compaction.enabled })),
+	strategy: Type.Optional(CompactionStrategySchema),
 	reserveTokens: Type.Optional(nonNegativeSafeInteger({ default: SETTINGS_DEFAULTS.compaction.reserveTokens })),
 	keepRecentTokens: Type.Optional(nonNegativeSafeInteger({ default: SETTINGS_DEFAULTS.compaction.keepRecentTokens })),
+	capacityRatioThreshold: Type.Optional(
+		Type.Number({
+			minimum: 0,
+			maximum: 1,
+			description: "Fraction of context window capacity (e.g. 0.5) that triggers compaction.",
+		}),
+	),
+	memoryStoragePath: Type.Optional(
+		Type.String({
+			description: "Custom file path for persisting memory nodes (defaults to ~/.pi/agent/memory-store.jsonl).",
+		}),
+	),
 	modelOverrides: Type.Optional(
 		Type.Record(Type.String(), CompactionModelOverrideSchema, {
 			description: 'Per-model overrides keyed by exact "provider/modelId" strings.',

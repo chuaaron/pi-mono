@@ -11,6 +11,7 @@ import { getClientIdentity } from "./client-identity.ts";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
 import type { ExtensionRunner, LoadExtensionsResult, SessionStartEvent, ToolDefinition } from "./extensions/index.ts";
 import { createToolNameMatcher } from "./mcp-servers.ts";
+import { MemoryStore } from "./memory/index.ts";
 import { convertToLlm } from "./messages.ts";
 import { findInitialModel } from "./model-resolver.ts";
 import { ModelRuntime } from "./model-runtime.ts";
@@ -103,7 +104,12 @@ export interface CreateAgentSessionOptions {
 	settingsManager?: SettingsManager;
 	/** Session start event metadata for extension runtime startup. */
 	sessionStartEvent?: SessionStartEvent;
+	/** Dark-layer memory store for conversation archival and sparse retrieval. */
+	memoryStore?: MemoryStore;
 }
+
+/** Convenience alias for CreateAgentSessionOptions */
+export type AgentSessionOptions = CreateAgentSessionOptions;
 
 /** Result from createAgentSession */
 export interface CreateAgentSessionResult {
@@ -279,7 +285,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 	const toolListError = options.tools ? getToolListError(options.tools) : undefined;
 	if (toolListError) throw new Error(`Invalid tools option: ${toolListError}`);
-	const defaultToolNames = options.noTools ? [] : (settingsManager.getDefaultTools() ?? DEFAULT_TOOL_NAMES);
+	const compactionStrategy = settingsManager.getCompactionStrategy(model);
+	const baseDefaultToolNames = options.noTools ? [] : (settingsManager.getDefaultTools() ?? DEFAULT_TOOL_NAMES);
+	const defaultToolNames =
+		compactionStrategy === "sliding-memory" && !options.noTools && !baseDefaultToolNames.includes("memory_search")
+			? [...baseDefaultToolNames, "memory_search"]
+			: baseDefaultToolNames;
 	// A `tools` list of only `+name`/`-name` entries changes the default selection instead of
 	// replacing it, like the `defaultTools` setting.
 	const toolModifiers = options.tools?.some(isToolModifier) ? options.tools : undefined;
@@ -452,6 +463,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		sessionManager.appendThinkingLevelChange(thinkingLevel);
 	}
 
+	const defaultMemoryStorePath =
+		settingsManager.getCompactionMemoryStoragePath() ?? join(getAgentDir(), "memory-store.jsonl");
+	const memoryStore =
+		options.memoryStore ??
+		(sessionManager.getSessionFile()
+			? MemoryStore.open({ storageFilePath: defaultMemoryStorePath })
+			: MemoryStore.inMemory());
+
 	const session = new AgentSession({
 		agent,
 		sessionManager,
@@ -469,6 +488,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		excludedToolNames,
 		extensionRunnerRef,
 		sessionStartEvent: options.sessionStartEvent,
+		memoryStore,
 	});
 
 	const extensionsResult = resourceLoader.getExtensions();

@@ -1,5 +1,7 @@
 import { DEFAULT_MAX_AGENT_RETRY_DELAY_MS } from "@earendil-works/pi-ai/utils/retry";
 
+export type CompactionStrategy = "sliding-memory" | "native";
+
 /** Runtime defaults shared by settings accessors and the published JSON Schema. */
 export const SETTINGS_DEFAULTS = {
 	transport: "auto",
@@ -10,6 +12,9 @@ export const SETTINGS_DEFAULTS = {
 		enabled: true,
 		reserveTokens: 16384,
 		keepRecentTokens: 20000,
+		strategy: undefined as CompactionStrategy | undefined,
+		capacityRatioThreshold: undefined as number | undefined,
+		memoryStoragePath: undefined as string | undefined,
 	},
 	branchSummary: {
 		reserveTokens: 16384,

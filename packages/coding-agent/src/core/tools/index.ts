@@ -43,6 +43,14 @@ export {
 	type LsToolOptions,
 } from "./ls.ts";
 export {
+	createMemorySearchTool,
+	createMemorySearchToolDefinition,
+	type MemorySearchToolDetails,
+	type MemorySearchToolInput,
+	type MemorySearchToolOptions,
+	memorySearchToolSystemPromptContribution,
+} from "./memory-search.ts";
+export {
 	createLocalPowerShellOperations,
 	createPowerShellTool,
 	createPowerShellToolDefinition,

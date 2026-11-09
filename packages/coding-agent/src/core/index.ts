@@ -7,6 +7,7 @@ export {
 	type AgentSessionConfig,
 	type AgentSessionEvent,
 	type AgentSessionEventListener,
+	type AgentSessionOptions,
 	type ModelCycleResult,
 	type PromptOptions,
 	type SessionStats,
@@ -94,4 +95,5 @@ export {
 	type TurnStartEvent,
 	type WorkingIndicatorOptions,
 } from "./extensions/index.ts";
+export * from "./memory/index.ts";
 export { createSyntheticSourceInfo } from "./source-info.ts";

@@ -9,10 +9,9 @@ import { CONFIG_DIR_NAME, getAgentDir } from "../config.ts";
 import { normalizePath, resolvePath } from "../utils/paths.ts";
 import { stripBom } from "../utils/text.ts";
 import { DEFAULT_HTTP_IDLE_TIMEOUT_MS, parseHttpIdleTimeoutMs } from "./http-dispatcher.ts";
-import { SETTINGS_DEFAULTS } from "./settings-defaults.ts";
+import { type CompactionStrategy, SETTINGS_DEFAULTS } from "./settings-defaults.ts";
 import type {
 	CacheWarmingMode,
-	CompactionModelOverride,
 	DefaultProjectTrust,
 	FullscreenExitOutput,
 	MermaidRenderingMode,
@@ -53,7 +52,7 @@ export type {
 /** Cache-warming profile. "idle" also warms between agent runs. */
 export const CACHE_WARMING_MODES = ["off", "streaming", "idle"] as const satisfies readonly CacheWarmingMode[];
 
-const DEFAULT_COMPACTION_TOKEN_SETTINGS: Required<CompactionModelOverride> = {
+const DEFAULT_COMPACTION_TOKEN_SETTINGS: Record<"reserveTokens" | "keepRecentTokens", number> = {
 	reserveTokens: SETTINGS_DEFAULTS.compaction.reserveTokens,
 	keepRecentTokens: SETTINGS_DEFAULTS.compaction.keepRecentTokens,
 };
@@ -844,7 +843,7 @@ export class SettingsManager {
 	}
 
 	private getCompactionTokenSetting(
-		field: keyof CompactionModelOverride,
+		field: "reserveTokens" | "keepRecentTokens",
 		model?: Pick<Model<string>, "provider" | "id">,
 	): number {
 		const compaction = this.settings.compaction;
@@ -879,17 +878,132 @@ export class SettingsManager {
 		return this.getCompactionTokenSetting("keepRecentTokens", model);
 	}
 
+	getCompactionStrategy(model?: Pick<Model<string>, "provider" | "id">): CompactionStrategy {
+		const compaction = this.settings.compaction;
+		const ordinary = compaction?.strategy;
+		if (ordinary !== undefined && ordinary !== "sliding-memory" && ordinary !== "native") {
+			throw new Error(`Invalid compaction.strategy setting: ${String(ordinary)}`);
+		}
+
+		const modelKey = model ? `${model.provider}/${model.id}` : undefined;
+		const entry = modelKey !== undefined ? compaction?.modelOverrides?.[modelKey] : undefined;
+		if (entry !== undefined && !isMergeableObject(entry)) {
+			throw new Error(
+				`Invalid compaction.modelOverrides["${modelKey}"] setting: ${String(entry)}. Expected an object.`,
+			);
+		}
+		const override = entry?.strategy;
+		if (override !== undefined && override !== "sliding-memory" && override !== "native") {
+			throw new Error(`Invalid compaction.modelOverrides["${modelKey}"].strategy setting: ${String(override)}`);
+		}
+		return override ?? ordinary ?? "native";
+	}
+
+	setCompactionStrategy(strategy: CompactionStrategy | undefined): void {
+		if (strategy !== undefined && strategy !== "sliding-memory" && strategy !== "native") {
+			throw new Error(`Invalid compaction.strategy setting: ${String(strategy)}`);
+		}
+		if (!this.globalSettings.compaction) {
+			this.globalSettings.compaction = {};
+		}
+		this.globalSettings.compaction.strategy = strategy;
+		this.markModified("compaction", "strategy");
+		this.save();
+	}
+
+	getCompactionMemoryStoragePath(): string | undefined {
+		const path = this.settings.compaction?.memoryStoragePath;
+		if (path !== undefined && typeof path !== "string") {
+			throw new Error(`Invalid compaction.memoryStoragePath setting: ${String(path)}. Expected a string.`);
+		}
+		return path;
+	}
+
+	setCompactionMemoryStoragePath(path: string | undefined): void {
+		if (path !== undefined && typeof path !== "string") {
+			throw new Error(`Invalid compaction.memoryStoragePath setting: ${String(path)}. Expected a string.`);
+		}
+		if (!this.globalSettings.compaction) {
+			this.globalSettings.compaction = {};
+		}
+		this.globalSettings.compaction.memoryStoragePath = path;
+		this.markModified("compaction", "memoryStoragePath");
+		this.save();
+	}
+
+	getCompactionCapacityRatioThreshold(model?: Pick<Model<string>, "provider" | "id">): number | undefined {
+		const compaction = this.settings.compaction;
+		const ordinary = compaction?.capacityRatioThreshold;
+		if (ordinary !== undefined && (typeof ordinary !== "number" || ordinary < 0 || ordinary > 1)) {
+			throw new Error(
+				`Invalid compaction.capacityRatioThreshold setting: ${String(ordinary)}. Expected a number between 0 and 1.`,
+			);
+		}
+
+		const modelKey = model ? `${model.provider}/${model.id}` : undefined;
+		const entry = modelKey !== undefined ? compaction?.modelOverrides?.[modelKey] : undefined;
+		if (entry !== undefined && !isMergeableObject(entry)) {
+			throw new Error(
+				`Invalid compaction.modelOverrides["${modelKey}"] setting: ${String(entry)}. Expected an object.`,
+			);
+		}
+		const override = entry?.capacityRatioThreshold;
+		if (override !== undefined && (typeof override !== "number" || override < 0 || override > 1)) {
+			throw new Error(
+				`Invalid compaction.modelOverrides["${modelKey}"].capacityRatioThreshold setting: ${String(override)}. Expected a number between 0 and 1.`,
+			);
+		}
+		return override ?? ordinary;
+	}
+
+	setCompactionCapacityRatioThreshold(threshold: number | undefined): void {
+		if (threshold !== undefined && (typeof threshold !== "number" || threshold < 0 || threshold > 1)) {
+			throw new Error(
+				`Invalid compaction.capacityRatioThreshold setting: ${String(threshold)}. Expected a number between 0 and 1.`,
+			);
+		}
+		if (!this.globalSettings.compaction) {
+			this.globalSettings.compaction = {};
+		}
+		this.globalSettings.compaction.capacityRatioThreshold = threshold;
+		this.markModified("compaction", "capacityRatioThreshold");
+		this.save();
+	}
+
 	/** Resolve each token setting through model override, ordinary setting, then built-in default. */
 	getCompactionSettings(model?: Pick<Model<string>, "provider" | "id">): {
 		enabled: boolean;
+		strategy?: CompactionStrategy;
 		reserveTokens: number;
 		keepRecentTokens: number;
+		capacityRatioThreshold?: number;
+		memoryStoragePath?: string;
 	} {
-		return {
+		const result: {
+			enabled: boolean;
+			strategy?: CompactionStrategy;
+			reserveTokens: number;
+			keepRecentTokens: number;
+			capacityRatioThreshold?: number;
+			memoryStoragePath?: string;
+		} = {
 			enabled: this.getCompactionEnabled(),
 			reserveTokens: this.getCompactionReserveTokens(model),
 			keepRecentTokens: this.getCompactionKeepRecentTokens(model),
 		};
+		const strategy = this.getCompactionStrategy(model);
+		if (strategy && strategy !== "native") {
+			result.strategy = strategy;
+		}
+		const capacityRatioThreshold = this.getCompactionCapacityRatioThreshold(model);
+		if (capacityRatioThreshold !== undefined) {
+			result.capacityRatioThreshold = capacityRatioThreshold;
+		}
+		const memoryStoragePath = this.getCompactionMemoryStoragePath();
+		if (memoryStoragePath !== undefined) {
+			result.memoryStoragePath = memoryStoragePath;
+		}
+		return result;
 	}
 
 	getBranchSummarySettings(): { reserveTokens: number; skipPrompt: boolean } {

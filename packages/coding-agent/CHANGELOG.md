@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+### Added
+
+- Opt-in sliding-window compaction and dark-layer memory store: set `compaction.strategy: "sliding-memory"` to archive discarded conversation segments losslessly into `MemoryStore` before compaction, append retrieval cues and pointer anchors to summaries, and enable active recall via the `memory_search` tool (native compaction remains the default)
+
+### Fixed
+
+- Fixed sliding-memory compaction dropping prefix turns during split user-message compaction: `compact()` and extension compaction hooks now losslessly archive all turns preceding the kept boundary via `getMessagesToArchive`
+- Fixed `memory_search` causing secondary context overflows: added result pagination (`limit`, default 5), message text truncation (2,000-4,000 chars), summary-first mode for queries and history chains (`includeMessages: false` by default), bounded history chain traversal depth, and total output response limits
+- Fixed `parentSessionId` storing raw file paths in `MemoryStore`: session manager now resolves parent session UUIDs and the store normalizes IDs during archival and history traversal
+- Fixed file-operation XML tags leaking into `Retrieval Cues` sections and bounded cues per pointer line to at most 10
+- Fixed compaction thrashing on negligible token drops: added progress floor requiring at least 500 dropped tokens on repeat compactions and fixed cut-point budget checks
+- Fixed extension-provided compaction bypassing dark-layer memory indexing: extension summaries now receive retrieval cues, memory node archival, and pointer lines
+- Fixed compaction retry duplication and multi-session store file corruption: deduplicated archival nodes on `firstKeptEntryId`, switched node deletions and clear operations to append-only tombstones, and added lazy file loading
+- Fixed `memory_search` being registered but never active: the system prompt told the model to use a tool it could not see, because the default active list hardcoded the four coding tools and the prompt guideline was gated on the tool registry instead of the active set. The guideline now follows the active set, and archived segments get their cues from the summary's `## Retrieval Cues` section (or a single-turn cue generation when the section is missing) instead of silently degrading to structural token extraction that wrote junk keys like `pwd && ls -la` into the index
+- Fixed `_checkCompaction` token accounting to preserve provider tokenizer counts in sliding-memory mode and prevent premature compaction or bypassed error-recovery threshold checks
+
 ## [1.5.2] - 2026-11-10
 
 ### New Features

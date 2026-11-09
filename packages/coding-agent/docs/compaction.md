@@ -28,11 +28,17 @@ Both use closely related structured formats and track file operations cumulative
 
 Auto-compaction triggers when:
 
-```
+```text
 contextTokens > contextWindow - reserveTokens
 ```
 
-By default, `reserveTokens` is 16384 tokens (configurable in `~/.pi/agent/settings.json` or `<project-dir>/.pi/settings.json`). It only decides when compaction starts. Summary requests use the model's output limit, reduced when needed so input and output fit the context window.
+or when `capacityRatioThreshold` is configured and:
+
+```text
+contextTokens >= contextWindow * capacityRatioThreshold
+```
+
+By default, `reserveTokens` is 16384 tokens (configurable in `~/.pi/agent/settings.json` or `<project-dir>/.pi/settings.json`). When `capacityRatioThreshold` is set (e.g. `0.5` for 50% capacity), Pi intercepts incoming prompts or turn starts earlier to maintain a compact working sliding window. It only decides when compaction starts. Summary requests use the model's output limit, reduced when needed so input and output fit the context window.
 
 During a multi-turn agent run, Pi checks the canonical projected context after tools finish and their results are appended, before starting the next assistant response. If the threshold is crossed, Pi compacts during `prepareNextTurn`, then performs the existing catch-up steering poll before `turn_start`. It skips this between-turn check when the completed tool batch terminates the run and no queued message requires another response. Pi also checks before a new user prompt and performs final-attempt overflow recovery after the low-level run ends.
 
@@ -81,6 +87,28 @@ What the LLM sees:
 ```
 
 On repeated compactions, the summarized span starts at the previous compaction's kept boundary (`firstKeptEntryId`), not at the compaction entry itself, falling back to the entry after the previous compaction if that kept entry cannot be found in the path. A retain-none compaction records its own ID as `firstKeptEntryId`; repeated compaction starts after that entry. This preserves messages that survived the earlier compaction by including them in the next summarization pass as well. Pi also recalculates `tokensBefore` from the rebuilt, context-edited session projection before writing the new `CompactionEntry`, so the token count reflects the actual pre-compaction context being replaced. Omitted raw entries remain stored but do not affect cut selection, summaries, checkpoints, or token estimates.
+
+### Sliding-Memory Archival and Active Retrieval
+
+To prevent context bloat and information loss during long sessions, Pi couples compaction with an indexed dark-layer memory store:
+
+1. **Lossless Archival**: Before discarded conversation turns are dropped from the working context window (encompassing both summarized spans and split-turn prefix messages), they are archived losslessly into `MemoryStore` via `getMessagesToArchive`.
+2. **Retrieval Cues**: Each archived segment is indexed with the semantic keys the model commits to in the summary's `## Retrieval Cues` section. When the summary omits the section, a single follow-up turn asks the model for the keys; if that also yields nothing, the segment is archived with no cues rather than falling back to structural token extraction, so the index never holds junk keys (search must be able to fail).
+3. **Traceable Context Pointers**: The generated compaction summary appends an explicit physical pointer referencing the archived memory node:
+   ```markdown
+   [Archived Session Pointer: Node <node-id> | Session <session-id>]
+   Retrieval Cues: <cues... or (none)>
+   Note: Full uncompressed details of this archived segment are preserved in the memory store. Use memory search to retrieve exact details.
+   ```
+4. **Active Recall via `memory_search`**: When `compaction.strategy` is set to `"sliding-memory"`, the `memory_search` tool is automatically activated. It provides structured retrieval across archived conversation history:
+   - `query`: Sparse keyword cue search. Returns matching segments with summaries, matched cues, and relevance scores. Turn message bodies are omitted by default to protect the active context window.
+   - `nodeId`: Direct pointer lookup for a specific archived node. Returns the node summary, cues, and turn messages (defaults to `includeMessages: true`).
+   - `historyChain`: When `nodeId` is specified, traverses the ancestry chain across nodes and parent session boundaries up to `maxDepth` (defaults to 5, configurable via `limit`). Returns hop summaries and cues by default.
+   - `sessionId`: Lists archived segments within a specific session (defaults to 5 results).
+   - `limit`: Maximum number of search results, session segments, or chain hops to return (defaults to 5).
+   - `includeMessages`: Controls whether turn message bodies are returned. Defaults to `true` for single `nodeId` direct lookups, and `false` for `query`, `sessionId`, and `historyChain` queries.
+   - **Bounded Output**: Output across all modes is strictly bounded. Messages are head/tail truncated (2,000 characters per message in searches and chains; 4,000 for single node lookup), large turn counts show the most recent turns with an omission notice, and overall response text is capped to prevent secondary context overflow.
+5. **Identifiable Retrieval Failure**: Unlike dense embeddings that force non-empty top-k matches, sparse cue search returns a distinguishable empty result (`No archived memory found...`) when no record exists, giving the agent confident confirmation that a topic or decision was never discussed.
 
 ### Overflow and Length Recovery Ordering
 
@@ -431,6 +459,7 @@ Configure compaction in `~/.pi/agent/settings.json` or `<project-dir>/.pi/settin
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `enabled` | `true` | Enable auto-compaction |
+| `strategy` | `"native"` | Compaction strategy: `"native"` (default) or `"sliding-memory"` |
 | `reserveTokens` | `16384` | Free context tokens below which auto-compaction starts |
 | `keepRecentTokens` | `20000` | Recent tokens to keep (not summarized) |
 

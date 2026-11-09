@@ -45,6 +45,7 @@ export {
 	generateSummary,
 	generateSummaryWithUsage,
 	getLastAssistantUsage,
+	getMessagesToArchive,
 	prepareBranchEntries,
 	serializeConversation,
 	shouldCompact,
@@ -253,6 +254,7 @@ export type { ResourceCollision, ResourceDiagnostic, ResourceLoader } from "./co
 export { DefaultResourceLoader, loadProjectContextFiles } from "./core/resource-loader.ts";
 // SDK for programmatic usage
 export {
+	type AgentSessionOptions,
 	AgentSessionRuntime,
 	type AgentSessionRuntimeDiagnostic,
 	type AgentSessionServices,
@@ -291,6 +293,7 @@ export {
 	CURRENT_SESSION_VERSION,
 	type CustomEntry,
 	type CustomMessageEntry,
+	extractSessionIdFromPath,
 	type FileEntry,
 	getLatestCompactionEntry,
 	type ModelChangeEntry,
@@ -352,6 +355,8 @@ export {
 	createLocalBashOperations,
 	createLocalPowerShellOperations,
 	createLsToolDefinition,
+	createMemorySearchTool,
+	createMemorySearchToolDefinition,
 	createPowerShellToolDefinition,
 	createReadToolDefinition,
 	createWriteToolDefinition,
@@ -374,6 +379,10 @@ export {
 	type LsToolDetails,
 	type LsToolInput,
 	type LsToolOptions,
+	type MemorySearchToolDetails,
+	type MemorySearchToolInput,
+	type MemorySearchToolOptions,
+	memorySearchToolSystemPromptContribution,
 	type PowerShellOperations,
 	type PowerShellSpawnContext,
 	type PowerShellSpawnHook,

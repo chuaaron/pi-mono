@@ -24,6 +24,8 @@ import type {
 	Usage,
 } from "@earendil-works/pi-ai/compat";
 import { completeSimple } from "@earendil-works/pi-ai/compat";
+import type { MemoryStore } from "../memory/index.ts";
+import { parseRetrievalCuesFromSummary } from "../memory/index.ts";
 import { convertToLlm } from "../messages.ts";
 import {
 	buildSessionProjection,
@@ -48,10 +50,11 @@ import {
 // File Operation Tracking
 // ============================================================================
 
-/** Details stored in CompactionEntry.details for file tracking */
+/** Details stored in CompactionEntry.details for file tracking and memory archival */
 export interface CompactionDetails {
 	readFiles: string[];
 	modifiedFiles: string[];
+	memoryNodeId?: string;
 }
 
 /**
@@ -117,14 +120,20 @@ export interface CompactionResult<T = unknown> {
 // Types
 // ============================================================================
 
+export type CompactionStrategy = "sliding-memory" | "native";
+
 export interface CompactionSettings {
 	enabled: boolean;
+	strategy?: CompactionStrategy;
 	reserveTokens: number;
 	keepRecentTokens: number;
+	capacityRatioThreshold?: number;
+	memoryStoragePath?: string;
 }
 
 export const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = {
 	enabled: true,
+	strategy: "native",
 	reserveTokens: 16384,
 	keepRecentTokens: 20000,
 };
@@ -266,7 +275,36 @@ export function estimateProjectedContextTokens(
  */
 export function shouldCompact(contextTokens: number, contextWindow: number, settings: CompactionSettings): boolean {
 	if (!settings.enabled) return false;
+	const strategy = settings.strategy ?? "native";
+	if (
+		strategy === "sliding-memory" &&
+		settings.capacityRatioThreshold !== undefined &&
+		settings.capacityRatioThreshold > 0
+	) {
+		if (contextTokens >= contextWindow * settings.capacityRatioThreshold) {
+			return true;
+		}
+	}
 	return contextTokens > contextWindow - settings.reserveTokens;
+}
+
+/**
+ * Format an archived session pointer string for insertion into compaction summaries.
+ */
+export function formatArchivedSessionPointer(node: { id: string; sessionId: string; cues: string[] }): string {
+	const cueText = node.cues.length > 0 ? node.cues.slice(0, 10).join(", ") : "(none)";
+	return `[Archived Session Pointer: Node ${node.id} | Session ${node.sessionId}]\nRetrieval Cues: ${cueText}\nNote: Full uncompressed details of this archived segment are preserved in the memory store. Use memory search to retrieve exact details.`;
+}
+
+/**
+ * Append an archived session pointer to a compaction summary.
+ */
+export function appendArchivedSessionPointer(
+	summary: string,
+	node: { id: string; sessionId: string; cues: string[] },
+): string {
+	const pointer = formatArchivedSessionPointer(node);
+	return summary ? `${summary}\n\n${pointer}` : pointer;
 }
 
 // ============================================================================
@@ -457,6 +495,7 @@ export function findCutPoint(
 
 	// Walk backwards from newest, accumulating estimated message sizes
 	let accumulatedTokens = 0;
+	let exceededBudget = false;
 	let cutIndex = cutPoints[0]; // Default: keep from first message (not header)
 
 	for (let i = endIndex - 1; i >= startIndex; i--) {
@@ -470,12 +509,17 @@ export function findCutPoint(
 
 		// Check if we've exceeded the budget
 		if (accumulatedTokens >= keepRecentTokens) {
+			exceededBudget = true;
 			// Prefer the closest valid cut point at or after this entry. If trailing
 			// tool results exceed the budget by themselves, keep their preceding
 			// assistant tool call instead of falling back to the first message.
 			cutIndex = cutPoints.find((candidate) => candidate >= i) ?? cutPoints[cutPoints.length - 1];
 			break;
 		}
+	}
+
+	if (!exceededBudget) {
+		return { firstKeptEntryIndex: startIndex, turnStartIndex: -1, isSplitTurn: false };
 	}
 
 	// Scan backwards from cutIndex to include adjacent metadata entries that do not affect context.
@@ -535,14 +579,17 @@ Use this EXACT format:
 - [Any data, examples, or references needed to continue]
 - [Or "(none)" if not applicable]
 
-Keep each section concise. Preserve exact file paths, function names, and error messages.`;
+## Retrieval Cues
+- [3 to 8 concise, specific search keys/tags indicating future retrieval scenarios, e.g. "compaction-overflow-guard", "p2-plugin-architecture"]
+
+Keep each section concise. Preserve exact file paths, function names, error messages, and concrete verification results (tests executed, checks passed/failed, and pending verification debts).`;
 
 const UPDATE_SUMMARIZATION_INSTRUCTIONS = `Update the existing structured summary with new information. RULES:
 - PRESERVE all existing information from the previous summary
 - ADD new progress, decisions, and context from the new messages
 - UPDATE the Progress section: move items from "In Progress" to "Done" when completed
 - UPDATE "Next Steps" based on what was accomplished
-- PRESERVE exact file paths, function names, and error messages
+- PRESERVE exact file paths, function names, error messages, and verification obligations (unrun tests or unverified claims)
 - If something is no longer relevant, you may remove it
 
 Use this EXACT format:
@@ -572,11 +619,16 @@ Use this EXACT format:
 ## Critical Context
 - [Preserve important context, add new if needed]
 
+## Retrieval Cues
+- [3 to 8 concise, specific search keys indicating future retrieval scenarios; update to reflect current topics]
+
 Keep each section concise. Preserve exact file paths, function names, and error messages.`;
 
 const UPDATE_SUMMARIZATION_PROMPT = `The messages above are NEW conversation messages to incorporate into the existing summary provided in <previous-summary> tags.
 
 ${UPDATE_SUMMARIZATION_INSTRUCTIONS}`;
+
+const CUE_GENERATION_PROMPT = `The text above is a conversation summary. Output 3 to 8 concise, specific search keys (retrieval cues) for recalling this segment later: topics, decisions, file paths, identifiers. Reply with a single comma-separated line and nothing else.`;
 
 /**
  * Returns an error message when a summarization response cannot safely be persisted.
@@ -763,6 +815,8 @@ export interface CompactionPreparation {
 	messagesToSummarize: AgentMessage[];
 	/** Messages that will be turned into turn prefix summary (if splitting) */
 	turnPrefixMessages: AgentMessage[];
+	/** Full lossless sequence of messages being dropped from active context to archive */
+	messagesToArchive?: AgentMessage[];
 	/** Whether this is a split turn (cut point in middle of turn) */
 	isSplitTurn: boolean;
 	tokensBefore: number;
@@ -813,6 +867,10 @@ function findProjectedCutPoint(
 			cutIndex = cutPoints.find((candidate) => candidate >= i) ?? cutPoints[cutPoints.length - 1];
 			break;
 		}
+	}
+
+	if (!exceededBudget) {
+		return { firstKeptEntryIndex: startIndex, turnStartIndex: -1, isSplitTurn: false };
 	}
 
 	// A recovery attempt and its omission edits are context-invisible after the last
@@ -897,8 +955,19 @@ export function prepareCompaction(
 				.slice(cutPoint.turnStartIndex, cutPoint.firstKeptEntryIndex)
 				.flatMap(getMessagesFromProjectedEntryForCompaction)
 		: [];
+	const messagesToArchive = projectedEntries
+		.slice(boundaryStart, cutPoint.firstKeptEntryIndex)
+		.flatMap((entry) => (entry.sourceEntry.type === "compaction" ? [] : entry.messages));
 
 	if (messagesToSummarize.length === 0 && turnPrefixMessages.length === 0) return undefined;
+
+	// Progress floor: prevent thrashing when a compaction already exists and new messages
+	// drop fewer tokens than the summarization overhead.
+	const droppedMessages = [...messagesToSummarize, ...turnPrefixMessages];
+	const droppedTokens = droppedMessages.reduce((sum, msg) => sum + estimateTokens(msg), 0);
+	if (prevCompactionIndex >= 0 && settings.keepRecentTokens > 100 && droppedTokens < 500) {
+		return undefined;
+	}
 
 	// Extract file operations from edited model-visible messages and the previous compaction.
 	const fileOps = extractFileOperations(messagesToSummarize, sourceEntries, prevCompactionIndex);
@@ -914,12 +983,28 @@ export function prepareCompaction(
 		firstKeptEntryId,
 		messagesToSummarize,
 		turnPrefixMessages,
+		messagesToArchive,
 		isSplitTurn: cutPoint.isSplitTurn,
 		tokensBefore,
 		previousSummary,
 		fileOps,
 		settings,
 	};
+}
+
+/**
+ * Retrieve the full lossless sequence of messages being dropped from active context to archive.
+ * Preserves both pre-turn messages to summarize and split-turn prefix messages.
+ */
+export function getMessagesToArchive(
+	preparation: Pick<CompactionPreparation, "messagesToSummarize" | "turnPrefixMessages" | "messagesToArchive">,
+): AgentMessage[] {
+	if (preparation.messagesToArchive && preparation.messagesToArchive.length > 0) {
+		return preparation.messagesToArchive;
+	}
+	if (preparation.messagesToSummarize.length === 0) return preparation.turnPrefixMessages;
+	if (preparation.turnPrefixMessages.length === 0) return preparation.messagesToSummarize;
+	return [...preparation.messagesToSummarize, ...preparation.turnPrefixMessages];
 }
 
 // ============================================================================
@@ -936,6 +1021,9 @@ Create a concise checkpoint of the user's request and the progress shown above. 
 ## Progress So Far
 - [Key decisions and work completed in these messages]
 
+## Verification & Active Debts
+- [Concrete verification results (e.g. tests run, checks executed) vs what remains unverified or pending]
+
 ## Context Needed to Continue
 - [Information from these messages needed to understand the later work]
 
@@ -946,8 +1034,19 @@ Only summarize information explicitly present above. Do not infer or recreate la
  * Returns CompactionResult - SessionManager adds uuid/parentUuid when saving.
  *
  * @param preparation - Pre-calculated preparation from prepareCompaction()
+ * @param model - Model used for the summarization call
+ * @param apiKey - API key for the model provider
+ * @param headers - Optional request headers
  * @param customInstructions - Optional custom focus for the summary
+ * @param signal - Optional abort signal
+ * @param thinkingLevel - Optional thinking level for the summarization call
+ * @param streamFn - Optional stream function override
+ * @param env - Optional environment variables
+ * @param retry - Optional retry policy
+ * @param callbacks - Optional retry callbacks
  * @param sessionId - Optional routing session ID forwarded without enabling prompt caching
+ * @param memoryStore - Optional memory store for pointer extraction
+ * @param parentSessionId - Optional parent session ID for the memory chain
  */
 export async function compact(
 	preparation: CompactionPreparation,
@@ -962,7 +1061,9 @@ export async function compact(
 	retry?: RetryPolicy,
 	callbacks?: RetryCallbacks,
 	sessionId?: string,
-): Promise<CompactionResult> {
+	memoryStore?: MemoryStore,
+	parentSessionId?: string,
+): Promise<CompactionResult<CompactionDetails>> {
 	const {
 		firstKeptEntryId,
 		messagesToSummarize,
@@ -972,6 +1073,10 @@ export async function compact(
 		previousSummary,
 		fileOps,
 	} = preparation;
+
+	if (!firstKeptEntryId) {
+		throw new Error("First kept entry has no UUID - session may need migration");
+	}
 
 	// Generate summaries and merge into one
 	let summary: string;
@@ -1039,12 +1144,40 @@ export async function compact(
 		summaryUsage = result.usage;
 	}
 
+	// Cues are parsed from model-generated summary before file-ops XML blocks are appended
+	let cues = parseRetrievalCuesFromSummary(summary);
+
 	// Compute file lists and append to summary
 	const { readFiles, modifiedFiles } = computeFileLists(fileOps);
 	summary += formatFileOperations(readFiles, modifiedFiles);
 
-	if (!firstKeptEntryId) {
-		throw new Error("First kept entry has no UUID - session may need migration");
+	let memoryNodeId: string | undefined;
+	const messagesToArchive = getMessagesToArchive(preparation);
+	if (memoryStore && messagesToArchive.length > 0) {
+		if (cues.length === 0) {
+			cues = await generateRetrievalCues(summary, {
+				model,
+				apiKey,
+				headers,
+				env,
+				signal,
+				thinkingLevel,
+				streamFn,
+				retry,
+				callbacks,
+				sessionId,
+			});
+		}
+		const node = memoryStore.archiveSessionSegment({
+			sessionId: sessionId || "session",
+			parentSessionId,
+			firstKeptEntryId,
+			messages: messagesToArchive,
+			summary,
+			cues,
+		});
+		memoryNodeId = node.id;
+		summary = appendArchivedSessionPointer(summary, node);
 	}
 
 	return {
@@ -1052,8 +1185,63 @@ export async function compact(
 		firstKeptEntryId,
 		tokensBefore,
 		usage: summaryUsage,
-		details: { readFiles, modifiedFiles } as CompactionDetails,
+		details: { readFiles, modifiedFiles, ...(memoryNodeId ? { memoryNodeId } : {}) } as CompactionDetails,
 	};
+}
+
+export interface CueGenerationContext {
+	model: Model<any>;
+	apiKey: string | undefined;
+	headers?: Record<string, string>;
+	env?: Record<string, string>;
+	signal?: AbortSignal;
+	thinkingLevel?: ThinkingLevel;
+	streamFn?: StreamFn;
+	retry?: RetryPolicy;
+	callbacks?: RetryCallbacks;
+	sessionId?: string;
+}
+
+/**
+ * Single-turn fallback that asks the model for retrieval cues when the summary omits the
+ * `## Retrieval Cues` section. Returns an empty list when generation fails or yields nothing:
+ * a pointer to a cue-less node is honest, extracted junk keys would not be (search must be
+ * able to fail).
+ */
+export async function generateRetrievalCues(summary: string, context: CueGenerationContext): Promise<string[]> {
+	const { model, apiKey, headers, env, signal, thinkingLevel, streamFn, retry, callbacks, sessionId } = context;
+	try {
+		const response = await completeSummarization(
+			model,
+			buildSummarizationContext(`${summary}\n\n${CUE_GENERATION_PROMPT}`),
+			createSummarizationOptions(model, apiKey, headers, env, signal, thinkingLevel, sessionId),
+			streamFn,
+			retry,
+			callbacks,
+		);
+		if (getSummarizationFailure(response, "Cue generation")) {
+			return [];
+		}
+		return parseCueLine(contentText(response.content));
+	} catch {
+		// A summarization call that throws (abort, provider error after retries) must not fail
+		// compaction: the archive degrades to a cue-less node reachable via its pointer.
+		return [];
+	}
+}
+
+/** Parse a comma-separated cue line into clean, deduplicated, lowercase cue keys. */
+function parseCueLine(line: string): string[] {
+	const cues = line
+		.split(",")
+		.map((part) =>
+			part
+				.trim()
+				.replace(/^[`"'#*-]+|[`"'*]+$/g, "")
+				.toLowerCase(),
+		)
+		.filter((cue) => cue.length > 1 && cue.length < 60);
+	return Array.from(new Set(cues)).slice(0, 8);
 }
 
 /**

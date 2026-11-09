@@ -113,6 +113,19 @@
           "type": "boolean",
           "default": true
         },
+        "strategy": {
+          "anyOf": [
+            {
+              "type": "string",
+              "const": "sliding-memory"
+            },
+            {
+              "type": "string",
+              "const": "native"
+            }
+          ],
+          "description": "Compaction strategy: \"sliding-memory\" (lossless archival + sliding window) or \"native\" (Pi default)."
+        },
         "reserveTokens": {
           "type": "integer",
           "minimum": 0,
@@ -125,12 +138,35 @@
           "maximum": 9007199254740991,
           "default": 20000
         },
+        "capacityRatioThreshold": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Fraction of context window capacity (e.g. 0.5) that triggers compaction."
+        },
+        "memoryStoragePath": {
+          "type": "string",
+          "description": "Custom file path for persisting memory nodes (defaults to ~/.pi/agent/memory-store.jsonl)."
+        },
         "modelOverrides": {
           "type": "object",
           "patternProperties": {
             "^.*$": {
               "type": "object",
               "properties": {
+                "strategy": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "const": "sliding-memory"
+                    },
+                    {
+                      "type": "string",
+                      "const": "native"
+                    }
+                  ],
+                  "description": "Compaction strategy: \"sliding-memory\" (lossless archival + sliding window) or \"native\" (Pi default)."
+                },
                 "reserveTokens": {
                   "type": "integer",
                   "minimum": 0,
@@ -140,6 +176,12 @@
                   "type": "integer",
                   "minimum": 0,
                   "maximum": 9007199254740991
+                },
+                "capacityRatioThreshold": {
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1,
+                  "description": "Fraction of context window capacity (e.g. 0.5) that triggers compaction."
                 }
               }
             }
